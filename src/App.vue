@@ -16,9 +16,12 @@ const cursorEl = ref(null);
 
 // 标注
 const annotationMode = ref(false);
-// rows[r] = 第 r+1 行的音标点数组 [{x,y}]（x,y 为 0~1 相对坐标）
+const markMode = ref('rows'); // 'rows' 标行 | 'notes' 标序号
+const rowHeightPct = ref(4); // 行光带高度（谱面高度百分比，可调）
+const hoverY = ref(-1); // 标行模式下鼠标的相对 y（预览光带位置）
+// rows[r] = 第 r+1 行：{ top, height, notes: [{x}] }（均为 0~1 相对坐标）
 const rows = ref([]);
-const currentRow = ref(0);
+let undoStack = []; // 撤销栈（存对象引用，不受行/序号重排影响）
 
 // 播放
 const bpm = ref(120);
@@ -56,8 +59,8 @@ function toast(msg) {
 
 const flatNotes = computed(() => {
   const out = [];
-  rows.value.forEach((row) => {
-    row.forEach((n) => out.push({ x: n.x, y: n.y }));
+  rows.value.forEach((row, ri) => {
+    row.notes.forEach((n) => out.push({ x: n.x, ri }));
   });
   return out;
 });
@@ -65,31 +68,47 @@ const flatNotes = computed(() => {
 const markers = computed(() => {
   const out = [];
   rows.value.forEach((row, ri) => {
-    row.forEach((n, si) => {
-      out.push({ ri, si, x: n.x, y: n.y, row: ri + 1, seq: si + 1 });
+    const cy = row.top + row.height / 2;
+    row.notes.forEach((n, si) => {
+      out.push({ ri, si, x: n.x, y: cy, row: ri + 1, seq: si + 1 });
     });
   });
   return out;
 });
 
-const rowHeaders = computed(() => {
-  const out = [];
-  rows.value.forEach((row, ri) => {
-    if (row.length) out.push({ row: ri + 1, x: row[0].x, y: row[0].y });
-  });
-  return out;
+// 已固定的行光带（仅标注模式显示）
+const rowBands = computed(() =>
+  rows.value.map((row, ri) => ({ row: ri + 1, top: row.top, height: row.height }))
+);
+
+// 标行模式的预览光带（跟随鼠标）
+const previewBand = computed(() => {
+  if (markMode.value !== 'rows' || hoverY.value < 0) return null;
+  return bandAt(hoverY.value);
 });
 
 const cursorNote = computed(() => {
   const i = litIndex.value;
-  if (i >= 0 && i < flatNotes.value.length) return flatNotes.value[i];
-  return null;
+  if (i < 0 || i >= flatNotes.value.length) return null;
+  const fn = flatNotes.value[i];
+  const row = rows.value[fn.ri];
+  if (!row) return null;
+  return { x: fn.x, top: row.top, height: row.height };
 });
 
 const totalNotes = computed(() => flatNotes.value.length);
 
 function intervalMs() {
   return 60000 / Math.max(1, bpm.value);
+}
+
+// 由中心 y 计算行光带位置（相对坐标，自动钳制在谱面内）
+function bandAt(y) {
+  const h = Math.min(Math.max(Number(rowHeightPct.value) || 4, 1), 20) / 100;
+  let top = y - h / 2;
+  if (top < 0) top = 0;
+  if (top + h > 1) top = 1 - h;
+  return { top, height: h };
 }
 
 // ---------- 文件加载 ----------
@@ -110,7 +129,7 @@ async function onFileChange(e) {
     }
     // 新文件默认不加载旧标注
     rows.value = [];
-    currentRow.value = 0;
+    undoStack = [];
     saveName.value = file.name.replace(/\.[^.]+$/, '');
     refreshSavedList();
   } catch (err) {
@@ -131,14 +150,30 @@ function toggleAnnotation() {
   annotationMode.value = !annotationMode.value;
   if (annotationMode.value) {
     stop();
-    if (!rows.value.length) {
-      rows.value = [[]];
-      currentRow.value = 0;
-    } else {
-      currentRow.value = rows.value.length - 1;
-      if (!rows.value[currentRow.value]) rows.value[currentRow.value] = [];
-    }
+    // 已有行则直接进入标序号，否则从标行开始
+    markMode.value = rows.value.length ? 'notes' : 'rows';
+    undoStack = [];
   }
+}
+
+function setMarkMode(m) {
+  if (m === 'notes' && !rows.value.length) {
+    toast('请先标注行光带');
+    return;
+  }
+  markMode.value = m;
+}
+
+function onSurfaceMove(e) {
+  if (markMode.value !== 'rows') return;
+  const el = surface.value;
+  if (!el) return;
+  const r = el.getBoundingClientRect();
+  hoverY.value = (e.clientY - r.top) / r.height;
+}
+
+function onSurfaceLeave() {
+  hoverY.value = -1;
 }
 
 function onSurfaceClick(e) {
@@ -149,42 +184,75 @@ function onSurfaceClick(e) {
   const x = (e.clientX - r.left) / r.width;
   const y = (e.clientY - r.top) / r.height;
   if (x < 0 || x > 1 || y < 0 || y > 1) return;
-  if (!rows.value[currentRow.value]) rows.value[currentRow.value] = [];
-  rows.value[currentRow.value].push({ x, y });
-}
 
-function newRow() {
-  if (!annotationMode.value) return;
-  rows.value.push([]);
-  currentRow.value = rows.value.length - 1;
+  if (markMode.value === 'rows') {
+    // 点击固定一条行光带，按位置自上而下自动编号
+    const row = { ...bandAt(y), notes: [] };
+    rows.value.push(row);
+    rows.value.sort((a, b) => a.top - b.top);
+    undoStack.push({ type: 'row', row });
+  } else {
+    // 序号归属点击位置所在的行，行内按位置自动编号
+    const row = rows.value.find((rw) => y >= rw.top && y <= rw.top + rw.height);
+    if (!row) {
+      toast('请点击行光带范围内添加序号');
+      return;
+    }
+    const note = { x };
+    row.notes.push(note);
+    row.notes.sort((a, b) => a.x - b.x);
+    undoStack.push({ type: 'note', row, note });
+  }
 }
 
 function undoPoint() {
   if (!annotationMode.value) return;
-  const row = rows.value[currentRow.value];
-  if (row && row.length) {
-    row.pop();
-  } else if (currentRow.value > 0) {
-    rows.value.pop();
-    currentRow.value = rows.value.length - 1;
+  const last = undoStack.pop();
+  if (!last) return;
+  if (last.type === 'row') {
+    rows.value = rows.value.filter((r) => r !== last.row);
+  } else {
+    last.row.notes = last.row.notes.filter((n) => n !== last.note);
   }
 }
 
 function clearAnnotations() {
   if (!confirm('确定清空全部标注吗？')) return;
-  rows.value = [[]];
-  currentRow.value = 0;
+  rows.value = [];
+  undoStack = [];
+  markMode.value = 'rows';
   stop();
 }
 
-const currentRowCount = computed(
-  () => (rows.value[currentRow.value] || []).length
-);
-
 // ---------- 保存 / 读取 ----------
+// 兼容 v1（[[{x,y}]] 点数组）与 v2（[{top,height,notes}] 行光带）两种格式
+function normalizeRows(raw) {
+  if (!Array.isArray(raw)) return [];
+  if (raw.length && typeof raw[0] === 'object' && !Array.isArray(raw[0]) && 'top' in raw[0]) {
+    return raw.map((r) => ({
+      top: r.top,
+      height: r.height,
+      notes: Array.isArray(r.notes) ? r.notes.map((n) => ({ x: n.x })) : [],
+    }));
+  }
+  // v1 旧格式：按每行音标点的 y 范围估算行光带
+  return raw
+    .filter((r) => Array.isArray(r) && r.length)
+    .map((r) => {
+      const ys = r.map((n) => n.y);
+      const top = Math.max(0, Math.min(...ys) - 0.025);
+      const bottom = Math.min(1, Math.max(...ys) + 0.025);
+      return {
+        top,
+        height: Math.max(0.03, bottom - top),
+        notes: r.map((n) => ({ x: n.x })).sort((a, b) => a.x - b.x),
+      };
+    });
+}
+
 function buildData() {
   return {
-    v: 1,
+    v: 2,
     name: saveName.value,
     bpm: bpm.value,
     musicDelay: clampDelay(),
@@ -243,9 +311,8 @@ function deleteSaved() {
 
 function applyData(data) {
   stop();
-  rows.value = Array.isArray(data.rows) ? data.rows.map((r) => r.map((n) => ({ x: n.x, y: n.y }))) : [];
-  if (!rows.value.length) rows.value = [[]];
-  currentRow.value = rows.value.length - 1;
+  rows.value = normalizeRows(data.rows);
+  undoStack = [];
   if (typeof data.bpm === 'number') bpm.value = data.bpm;
   if (typeof data.musicDelay === 'number') musicDelay.value = data.musicDelay;
   if (typeof data.musicVolume === 'number') musicVolume.value = data.musicVolume;
@@ -465,7 +532,13 @@ refreshSavedList();
       <button class="btn" :class="{ active: annotationMode }" @click="toggleAnnotation">
         {{ annotationMode ? '退出标注' : '手动标注' }}
       </button>
-      <button class="btn" :disabled="!annotationMode" @click="newRow">下一行</button>
+      <template v-if="annotationMode">
+        <button class="btn" :class="{ active: markMode === 'rows' }" @click="setMarkMode('rows')">标注行</button>
+        <button class="btn" :class="{ active: markMode === 'notes' }" @click="setMarkMode('notes')">标序号</button>
+        <label v-if="markMode === 'rows'" class="field">行高%
+          <input type="number" class="num" min="1" max="20" step="0.5" v-model.number="rowHeightPct" />
+        </label>
+      </template>
       <button class="btn" :disabled="!annotationMode" @click="undoPoint">撤销</button>
       <button class="btn danger" @click="clearAnnotations">清空标注</button>
 
@@ -515,11 +588,14 @@ refreshSavedList();
     </div>
 
     <div class="status">
-      <template v-if="annotationMode">
-        正在标注第 <b>{{ currentRow + 1 }}</b> 行，已标 <b>{{ currentRowCount }}</b> 个音标。点击画面添加音标，完成后点「下一行」。
+      <template v-if="annotationMode && markMode === 'rows'">
+        已标 <b>{{ rows.length }}</b> 行。移动鼠标定位，点击固定行光带（行高可调）；全部行标完后切到「标序号」。
+      </template>
+      <template v-else-if="annotationMode">
+        共 <b>{{ rows.length }}</b> 行，已标 <b>{{ totalNotes }}</b> 个序号。点击行光带内添加序号，行内自动按位置编号。
       </template>
       <template v-else>
-        共 <b>{{ rows.filter(r => r.length).length }}</b> 行，<b>{{ totalNotes }}</b> 个音标。
+        共 <b>{{ rows.length }}</b> 行，<b>{{ totalNotes }}</b> 个音标。
         <template v-if="isPlaying && delayRemain > 0">
           <template v-if="musicUrl">音乐播放中，</template><b>{{ (delayRemain / 1000).toFixed(1) }}</b> 秒后开始显示标注…
         </template>
@@ -530,15 +606,19 @@ refreshSavedList();
     <div class="surface-wrap" ref="surfaceWrap">
       <div v-if="loading" class="loading">正在加载文件…</div>
       <div v-if="imgUrl" class="surface" ref="surface" @click="onSurfaceClick"
+           @mousemove="onSurfaceMove" @mouseleave="onSurfaceLeave"
            :class="{ crosshair: annotationMode && !isPlaying }">
         <img :src="imgUrl" class="score-img" alt="鼓谱" />
 
-        <!-- 行号标签 + 音标点：仅在标注模式下显示，退出后隐藏，保持谱面干净 -->
+        <!-- 行光带 + 序号点：仅在标注模式下显示，退出后隐藏，保持谱面干净 -->
         <template v-if="annotationMode">
-          <div v-for="h in rowHeaders" :key="'h' + h.row" class="row-header"
-               :style="{ left: h.x * 100 + '%', top: h.y * 100 + '%' }">
-            第{{ h.row }}行
+          <div v-for="b in rowBands" :key="'band' + b.row" class="row-band"
+               :style="{ top: b.top * 100 + '%', height: b.height * 100 + '%' }">
+            <span class="band-label">第{{ b.row }}行</span>
           </div>
+
+          <div v-if="previewBand" class="row-band preview"
+               :style="{ top: previewBand.top * 100 + '%', height: previewBand.height * 100 + '%' }"></div>
 
           <div v-for="m in markers" :key="m.ri + '-' + m.si" class="marker"
                :style="{ left: m.x * 100 + '%', top: m.y * 100 + '%' }">
@@ -546,13 +626,13 @@ refreshSavedList();
           </div>
         </template>
 
-        <!-- 播放光标 -->
+        <!-- 播放高亮块：占满所在行高，宽度为序号标记宽度 -->
         <div v-if="cursorNote" class="cursor" ref="cursorEl"
-             :style="{ left: cursorNote.x * 100 + '%', top: cursorNote.y * 100 + '%' }"></div>
+             :style="{ left: cursorNote.x * 100 + '%', top: cursorNote.top * 100 + '%', height: cursorNote.height * 100 + '%' }"></div>
       </div>
       <div v-else-if="!loading" class="empty">
         <p>请点击上方「上传鼓谱」按钮，选择图片或 PDF 文件。</p>
-        <p class="hint">上传后点「手动标注」，依次点击每个音标位置；一行标完点「下一行」。标注可保存，之后用于按速度播放。</p>
+        <p class="hint">上传后点「手动标注」：先移动鼠标点击固定行光带（行高可调），全部行标完切到「标序号」，在行内点击添加序号。标注可保存，之后按行号、序号顺序播放。</p>
       </div>
 
       <!-- 延时倒计时遮罩 -->
@@ -705,9 +785,25 @@ refreshSavedList();
   font-weight: 700;
   line-height: 1;
 }
-.row-header {
+.row-band {
   position: absolute;
-  transform: translate(14px, -34px);
+  left: 0;
+  right: 0;
+  background: rgba(37, 99, 235, 0.10);
+  border-top: 1px dashed rgba(37, 99, 235, 0.5);
+  border-bottom: 1px dashed rgba(37, 99, 235, 0.5);
+  pointer-events: none;
+}
+.row-band.preview {
+  z-index: 3;
+  background: rgba(37, 99, 235, 0.18);
+  border: 1px dashed #2563eb;
+}
+.band-label {
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  transform: translateY(-50%);
   background: #dc2626;
   color: #fff;
   font-size: 11px;
@@ -715,14 +811,12 @@ refreshSavedList();
   padding: 2px 6px;
   border-radius: 4px;
   white-space: nowrap;
-  pointer-events: none;
 }
 .cursor {
   position: absolute;
-  width: 44px;
-  height: 44px;
-  margin: -22px 0 0 -22px;
-  border-radius: 8px;
+  width: 28px;
+  margin-left: -14px;
+  border-radius: 6px;
   background: rgba(250, 204, 21, 0.35);
   border: 3px solid #f59e0b;
   box-shadow: 0 0 12px rgba(245, 158, 11, 0.8);
