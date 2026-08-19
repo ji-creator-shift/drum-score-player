@@ -34,6 +34,17 @@ const savedNames = ref([]);
 const selectedSaved = ref('');
 const importInput = ref(null);
 
+// 背景音乐 / 延时
+const musicName = ref('');
+const musicUrl = ref('');
+const audioEl = ref(null);
+const musicVolume = ref(0.8);   // 音乐音量 0~1
+const musicDelay = ref(2);      // 延时秒数：点击播放后先放音乐，倒计时结束再开始显示标注
+const countIn = ref(false);     // 延时期间按 BPM 打点（预备拍）
+const delayRemain = ref(0);     // 剩余延时（毫秒），>0 表示处于延时阶段
+let delayTimer = null;
+let nextBeatAt = 0;
+
 // 轻提示（3 秒自动消失，不阻塞）
 const toastText = ref('');
 let toastTimer = null;
@@ -172,7 +183,15 @@ const currentRowCount = computed(
 
 // ---------- 保存 / 读取 ----------
 function buildData() {
-  return { v: 1, name: saveName.value, bpm: bpm.value, rows: rows.value };
+  return {
+    v: 1,
+    name: saveName.value,
+    bpm: bpm.value,
+    musicDelay: clampDelay(),
+    musicVolume: musicVolume.value,
+    countIn: countIn.value,
+    rows: rows.value,
+  };
 }
 
 function refreshSavedList() {
@@ -228,6 +247,9 @@ function applyData(data) {
   if (!rows.value.length) rows.value = [[]];
   currentRow.value = rows.value.length - 1;
   if (typeof data.bpm === 'number') bpm.value = data.bpm;
+  if (typeof data.musicDelay === 'number') musicDelay.value = data.musicDelay;
+  if (typeof data.musicVolume === 'number') musicVolume.value = data.musicVolume;
+  if (typeof data.countIn === 'boolean') countIn.value = data.countIn;
   if (typeof data.name === 'string') saveName.value = data.name;
 }
 
@@ -265,12 +287,62 @@ function onImportChange(e) {
   e.target.value = '';
 }
 
+// ---------- 背景音乐 ----------
+function onMusicChange(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  stop();
+  if (musicUrl.value) URL.revokeObjectURL(musicUrl.value);
+  musicUrl.value = URL.createObjectURL(file);
+  musicName.value = file.name;
+  e.target.value = '';
+}
+
+function removeMusic() {
+  stop();
+  if (musicUrl.value) URL.revokeObjectURL(musicUrl.value);
+  musicUrl.value = '';
+  musicName.value = '';
+}
+
+function clampDelay() {
+  const v = Number(musicDelay.value);
+  musicDelay.value = Math.min(60, Math.max(0, isNaN(v) ? 0 : v));
+  return musicDelay.value;
+}
+
+// 延时阶段：倒计时 + 可选预备拍，结束后进入标注播放
+function runDelay(ms) {
+  const startAt = performance.now();
+  const endAt = startAt + ms;
+  nextBeatAt = startAt;
+  delayRemain.value = ms;
+  delayTimer = setInterval(() => {
+    const now = performance.now();
+    if (countIn.value && soundOn.value) {
+      while (nextBeatAt <= now && nextBeatAt < endAt) {
+        playDrumHit();
+        nextBeatAt += intervalMs();
+      }
+    }
+    if (now >= endAt) {
+      clearInterval(delayTimer);
+      delayTimer = null;
+      delayRemain.value = 0;
+      if (isPlaying.value) tick();
+    } else {
+      delayRemain.value = endAt - now;
+    }
+  }, 25);
+}
+
 // ---------- 播放 ----------
 function tick() {
   if (!isPlaying.value) return;
   const notes = flatNotes.value;
   if (flatIndex.value >= notes.length) {
-    isPlaying.value = false;
+    // 标注播放完毕，连同背景音乐一起停止
+    stop();
     return;
   }
   litIndex.value = flatIndex.value;
@@ -286,21 +358,53 @@ function play() {
   }
   if (annotationMode.value) annotationMode.value = false;
   resumeAudio();
-  if (flatIndex.value >= flatNotes.value.length) flatIndex.value = 0;
+  if (flatIndex.value >= flatNotes.value.length) {
+    flatIndex.value = 0;
+    litIndex.value = -1;
+  }
   isPlaying.value = true;
-  tick();
+
+  // 背景音乐：从当前进度继续（首次即从头开始）
+  if (musicUrl.value && audioEl.value) {
+    audioEl.value.volume = musicVolume.value;
+    audioEl.value.play().catch(() => {});
+  }
+
+  if (delayRemain.value > 0) {
+    runDelay(delayRemain.value); // 暂停恢复：继续剩余延时
+  } else if (flatIndex.value === 0 && litIndex.value === -1) {
+    const d = clampDelay();
+    if (d > 0) runDelay(d * 1000); // 全新播放：先出音乐 + 延时倒计时
+    else tick();
+  } else {
+    tick();
+  }
 }
 
 function pause() {
   isPlaying.value = false;
   clearTimeout(timer);
+  if (delayTimer) {
+    clearInterval(delayTimer);
+    delayTimer = null;
+  }
+  if (audioEl.value) audioEl.value.pause();
 }
 
 function stop() {
   isPlaying.value = false;
   clearTimeout(timer);
+  if (delayTimer) {
+    clearInterval(delayTimer);
+    delayTimer = null;
+  }
+  delayRemain.value = 0;
   flatIndex.value = 0;
   litIndex.value = -1;
+  if (audioEl.value) {
+    audioEl.value.pause();
+    audioEl.value.currentTime = 0;
+  }
 }
 
 // 播放时自动滚动跟随光标
@@ -320,9 +424,27 @@ watch(litIndex, () => {
   });
 });
 
+// 音量实时生效
+watch(musicVolume, (v) => {
+  if (audioEl.value) audioEl.value.volume = Math.min(1, Math.max(0, v));
+});
+
+// 空格键：播放 / 暂停
+function onKeydown(e) {
+  if (e.code !== 'Space') return;
+  const t = e.target;
+  if (t && ['INPUT', 'SELECT', 'TEXTAREA'].includes(t.tagName)) return;
+  e.preventDefault();
+  if (isPlaying.value) pause();
+  else play();
+}
+window.addEventListener('keydown', onKeydown);
+
 onBeforeUnmount(() => {
   clearTimeout(timer);
   clearTimeout(toastTimer);
+  clearInterval(delayTimer);
+  window.removeEventListener('keydown', onKeydown);
 });
 
 refreshSavedList();
@@ -370,6 +492,23 @@ refreshSavedList();
 
       <span class="sep"></span>
 
+      <label class="btn">导入音乐
+        <input type="file" accept="audio/*" @change="onMusicChange" hidden />
+      </label>
+      <span v-if="musicName" class="music-name" :title="musicName">🎵 {{ musicName }}</span>
+      <button v-if="musicUrl" class="btn danger" @click="removeMusic">移除</button>
+      <label class="field">延时(秒)
+        <input type="number" class="num num-delay" min="0" max="60" step="0.1" v-model.number="musicDelay" />
+      </label>
+      <label class="field check">
+        <input type="checkbox" v-model="countIn" /> 延时打点
+      </label>
+      <label class="field">音乐音量
+        <input type="range" class="vol" min="0" max="1" step="0.05" v-model.number="musicVolume" />
+      </label>
+
+      <span class="sep"></span>
+
       <button v-if="!isPlaying" class="btn primary" @click="play">▶ 播放</button>
       <button v-else class="btn warn" @click="pause">⏸ 暂停</button>
       <button class="btn" @click="stop">⏹ 停止</button>
@@ -381,7 +520,10 @@ refreshSavedList();
       </template>
       <template v-else>
         共 <b>{{ rows.filter(r => r.length).length }}</b> 行，<b>{{ totalNotes }}</b> 个音标。
-        <template v-if="isPlaying">播放中…</template>
+        <template v-if="isPlaying && delayRemain > 0">
+          <template v-if="musicUrl">音乐播放中，</template><b>{{ (delayRemain / 1000).toFixed(1) }}</b> 秒后开始显示标注…
+        </template>
+        <template v-else-if="isPlaying">播放中…</template>
       </template>
     </div>
 
@@ -412,7 +554,15 @@ refreshSavedList();
         <p>请点击上方「上传鼓谱」按钮，选择图片或 PDF 文件。</p>
         <p class="hint">上传后点「手动标注」，依次点击每个音标位置；一行标完点「下一行」。标注可保存，之后用于按速度播放。</p>
       </div>
+
+      <!-- 延时倒计时遮罩 -->
+      <div v-if="isPlaying && delayRemain > 0" class="countdown">
+        {{ Math.ceil(delayRemain / 1000) }}
+      </div>
     </div>
+
+    <!-- 背景音乐 -->
+    <audio v-if="musicUrl" ref="audioEl" :src="musicUrl" preload="auto"></audio>
 
     <transition name="toast-fade">
       <div v-if="toastText" class="toast">{{ toastText }}</div>
@@ -483,6 +633,29 @@ refreshSavedList();
 .field { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
 .num { width: 64px; padding: 5px 6px; border: 1px solid #d0d3d9; border-radius: 6px; }
 .check { cursor: pointer; }
+.music-name {
+  font-size: 13px;
+  color: #4e5969;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.num-delay { width: 58px; }
+.vol { width: 84px; accent-color: #2563eb; }
+.countdown {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 96px;
+  font-weight: 700;
+  color: #1f2329;
+  background: rgba(255, 255, 255, 0.72);
+  pointer-events: none;
+  z-index: 5;
+}
 .status {
   padding: 6px 16px;
   font-size: 13px;
