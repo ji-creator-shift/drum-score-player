@@ -16,13 +16,7 @@ export function currentUser() {
   return sb ? sb.auth.getUser().then((r) => r.data.user) : Promise.resolve(null);
 }
 
-export async function signUp(email, password) {
-  const { data, error } = await sb.auth.signUp({ email, password });
-  if (error) throw error;
-  // 部分配置下注册后需先验证邮箱（data.user 存在但 session 为空）
-  return { user: data.user, needsConfirm: !data.session };
-}
-
+// 注册已关闭（商用模式）：账号由管理员在 Supabase 后台创建
 export async function signIn(email, password) {
   const { data, error } = await sb.auth.signInWithPassword({ email, password });
   if (error) throw error;

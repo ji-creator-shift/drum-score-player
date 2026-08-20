@@ -12,8 +12,13 @@ async function ensureCloud() {
   return cloudApi;
 }
 
-const DATA_PREFIX = 'drumScore:data:';
+const DATA_PREFIX = 'drumScore:data';
 const INDEX_KEY = 'drumScore:index';
+// 本地保存按账号隔离：同一浏览器多账号互不可见（商用隐私要求）
+const localIndexKey = computed(() => INDEX_KEY + ':' + (user.value ? user.value.id : 'guest'));
+function localDataKey(name) {
+  return DATA_PREFIX + ':' + (user.value ? user.value.id : 'guest') + ':' + name;
+}
 
 // 文件 / 画面
 const fileName = ref('');
@@ -63,61 +68,38 @@ const delayRemain = ref(0);     // 剩余延时（毫秒），>0 表示处于延
 let delayTimer = null;
 let nextBeatAt = 0;
 
-// ---------- 账号 / 云同步 ----------
+// ---------- 账号（商用模式：登录才能用，注册权在管理员手中） ----------
 const user = ref(null);
-const showAuth = ref(false);
-const authMode = ref('login'); // 'login' | 'register'
+const authChecking = ref(true); // 启动时检查会话，避免已登录用户闪现登录页
 const authEmail = ref('');
 const authPassword = ref('');
 const authBusy = ref(false);
+const authError = ref('');
 const cloudNames = ref([]); // 云端标注列表 [{id,name,updated_at}]
 const selectedCloud = ref('');
-
-function openAuth(mode) {
-  authMode.value = mode;
-  showAuth.value = true;
-}
 
 // 常见 Supabase 错误翻译
 function authErrText(e) {
   const m = String((e && (e.message || e.error_description)) || '未知错误');
   if (/invalid login/i.test(m)) return '邮箱或密码错误';
-  if (/already registered/i.test(m)) return '该邮箱已注册';
-  if (/failed to fetch/i.test(m)) return '网络连接失败，请检查网络或 Supabase 配置';
+  if (/failed to fetch/i.test(m)) return '网络连接失败，请稍后重试';
   return m;
 }
 
-async function doAuth() {
-  if (!cloudReady) {
-    toast('云端功能未配置：请先在 .env 填入 Supabase 参数');
-    return;
-  }
+async function doLogin() {
   const email = authEmail.value.trim();
   const pwd = authPassword.value;
+  authError.value = '';
   if (!email || !pwd) {
-    toast('请输入邮箱和密码');
+    authError.value = '请输入邮箱和密码';
     return;
   }
   authBusy.value = true;
   try {
-    const m = await ensureCloud();
-    if (authMode.value === 'login') {
-      await m.signIn(email, pwd);
-      toast('登录成功');
-    } else {
-      const r = await m.signUp(email, pwd);
-      if (r.needsConfirm) {
-        toast('注册成功，请到邮箱完成验证后再登录');
-        authMode.value = 'login';
-        return;
-      }
-      toast('注册成功');
-    }
-    showAuth.value = false;
-    authEmail.value = '';
+    await (await ensureCloud()).signIn(email, pwd);
     authPassword.value = '';
   } catch (err) {
-    toast('操作失败：' + authErrText(err));
+    authError.value = authErrText(err);
   } finally {
     authBusy.value = false;
   }
@@ -128,11 +110,39 @@ async function doLogout() {
   toast('已退出登录');
 }
 
-// 登录态变化 → 刷新云端列表
+// 账号切换/退出：清空工作区（谱面、标注、音乐都是本地数据，防止共用电脑时泄露）
+function resetWorkspace() {
+  stop();
+  annotationMode.value = false;
+  markMode.value = 'rows';
+  rows.value = [];
+  undoStack = [];
+  repeatRegions.value = [];
+  repeatSel.value = null;
+  saveName.value = '';
+  savedNames.value = [];
+  selectedSaved.value = '';
+  if (imgUrl.value) {
+    URL.revokeObjectURL(imgUrl.value);
+    imgUrl.value = '';
+  }
+  fileName.value = '';
+  if (musicUrl.value) {
+    URL.revokeObjectURL(musicUrl.value);
+    musicUrl.value = '';
+    musicName.value = '';
+  }
+}
+
+// 登录态变化 → 清场后重载该账号的本地列表与云端列表
 watch(user, (u) => {
+  resetWorkspace();
   cloudNames.value = [];
   selectedCloud.value = '';
-  if (u) refreshCloud();
+  if (u) {
+    refreshSavedList();
+    refreshCloud();
+  }
 });
 
 async function refreshCloud() {
@@ -147,11 +157,6 @@ async function refreshCloud() {
 }
 
 async function cloudSaveNow() {
-  if (!user.value) {
-    openAuth('login');
-    toast('请先登录账号');
-    return;
-  }
   const name = (saveName.value || '').trim() || (fileName.value || '未命名');
   try {
     const id = await (await ensureCloud()).cloudSave(name, buildData());
@@ -550,7 +555,7 @@ function buildData() {
 
 function refreshSavedList() {
   try {
-    const arr = JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
+    const arr = JSON.parse(localStorage.getItem(localIndexKey.value) || '[]');
     savedNames.value = arr;
     if (!selectedSaved.value && arr.length) selectedSaved.value = arr[0];
   } catch {
@@ -561,11 +566,11 @@ function refreshSavedList() {
 function saveAnnotations() {
   const name = (saveName.value || '').trim() || (fileName.value || '未命名');
   saveName.value = name;
-  localStorage.setItem(DATA_PREFIX + name, JSON.stringify(buildData()));
+  localStorage.setItem(localDataKey(name), JSON.stringify(buildData()));
   const set = new Set(savedNames.value);
   set.add(name);
   savedNames.value = [...set];
-  localStorage.setItem(INDEX_KEY, JSON.stringify(savedNames.value));
+  localStorage.setItem(localIndexKey.value, JSON.stringify(savedNames.value));
   selectedSaved.value = name;
   toast('已保存：' + name);
 }
@@ -576,7 +581,7 @@ function loadAnnotations() {
     toast('没有可读取的标注');
     return;
   }
-  const raw = localStorage.getItem(DATA_PREFIX + name);
+  const raw = localStorage.getItem(localDataKey(name));
   if (!raw) {
     toast('未找到该标注');
     return;
@@ -589,9 +594,9 @@ function deleteSaved() {
   const name = selectedSaved.value;
   if (!name) return;
   if (!confirm('删除保存的标注「' + name + '」？')) return;
-  localStorage.removeItem(DATA_PREFIX + name);
+  localStorage.removeItem(localDataKey(name));
   savedNames.value = savedNames.value.filter((n) => n !== name);
-  localStorage.setItem(INDEX_KEY, JSON.stringify(savedNames.value));
+  localStorage.setItem(localIndexKey.value, JSON.stringify(savedNames.value));
   if (savedNames.value.length) selectedSaved.value = savedNames.value[0];
 }
 
@@ -802,6 +807,7 @@ watch(musicVolume, (v) => {
 // 空格键：播放 / 暂停
 function onKeydown(e) {
   if (e.code !== 'Space') return;
+  if (!user.value) return; // 未登录不响应
   const t = e.target;
   if (t && ['INPUT', 'SELECT', 'TEXTAREA'].includes(t.tagName)) return;
   e.preventDefault();
@@ -819,21 +825,56 @@ onBeforeUnmount(() => {
 
 // 云端登录态初始化（后台加载，不阻塞首屏）
 if (cloudReady) {
-  ensureCloud().then((m) => {
-    m.currentUser().then((u) => {
-      user.value = u;
+  ensureCloud()
+    .then(async (m) => {
+      user.value = await m.currentUser();
+      authChecking.value = false;
+      m.onAuthChange((u) => {
+        user.value = u;
+      });
+    })
+    .catch(() => {
+      authChecking.value = false;
     });
-    m.onAuthChange((u) => {
-      user.value = u;
-    });
-  });
+} else {
+  authChecking.value = false;
 }
-
-refreshSavedList();
 </script>
 
 <template>
   <div class="app">
+    <!-- 未配置云端：不可用 -->
+    <div v-if="!cloudReady" class="gate">
+      <div class="gate-card">
+        <div class="gate-icon">🥁</div>
+        <div class="gate-title">鼓谱标注播放器</div>
+        <p class="gate-error-static">系统未配置，无法使用，请联系服务商。</p>
+      </div>
+    </div>
+
+    <!-- 登录闸门：未登录不能使用任何功能 -->
+    <div v-else-if="!user" class="gate">
+      <div class="gate-card">
+        <div class="gate-icon">🥁</div>
+        <div class="gate-title">鼓谱标注播放器</div>
+        <div class="gate-sub">Drum Score Studio</div>
+        <div v-if="authChecking" class="gate-checking">正在检查登录状态…</div>
+        <template v-else>
+          <input v-model="authEmail" type="email" class="modal-input" placeholder="邮箱"
+                 @keyup.enter="doLogin" />
+          <input v-model="authPassword" type="password" class="modal-input" placeholder="密码"
+                 @keyup.enter="doLogin" />
+          <div v-if="authError" class="gate-error">{{ authError }}</div>
+          <button class="btn primary block" :disabled="authBusy" @click="doLogin">
+            {{ authBusy ? '登录中…' : '登 录' }}
+          </button>
+          <p class="gate-tip">账号由管理员统一分配，如需开通请联系管理员。</p>
+        </template>
+      </div>
+    </div>
+
+    <!-- 主界面（登录后） -->
+    <template v-else>
     <!-- 顶栏 -->
     <header class="topbar">
       <div class="brand">
@@ -851,16 +892,12 @@ refreshSavedList();
 
       <div class="flex-spacer"></div>
 
-      <!-- 账号区 -->
-      <template v-if="cloudReady">
-        <div v-if="user" class="user-chip">
-          <span class="avatar">{{ (user.email || 'U').slice(0, 1).toUpperCase() }}</span>
-          <span class="user-email">{{ user.email }}</span>
-          <button class="link-btn" @click="doLogout">退出</button>
-        </div>
-        <button v-else class="btn ghost" @click="openAuth('login')">登录 / 注册</button>
-      </template>
-      <span v-else class="cloud-off" title="在 .env 中配置 Supabase 后可启用云同步">☁ 云端未配置</span>
+      <!-- 账号区（登录闸门保证此处必有账号） -->
+      <div class="user-chip">
+        <span class="avatar">{{ (user.email || 'U').slice(0, 1).toUpperCase() }}</span>
+        <span class="user-email">{{ user.email }}</span>
+        <button class="link-btn" @click="doLogout">退出</button>
+      </div>
     </header>
 
     <!-- 工具栏 -->
@@ -901,7 +938,7 @@ refreshSavedList();
         <input ref="importInput" type="file" accept="application/json" hidden @change="onImportChange" />
       </div>
 
-      <div v-if="cloudReady && user" class="tgroup">
+      <div class="tgroup">
         <span class="tlabel">云端</span>
         <button class="btn accent" @click="cloudSaveNow">同步</button>
         <select v-model="selectedCloud" class="sel">
@@ -1011,31 +1048,11 @@ refreshSavedList();
 
     <!-- 背景音乐 -->
     <audio v-if="musicUrl" ref="audioEl" :src="musicUrl" preload="auto"></audio>
+    </template>
 
     <transition name="toast-fade">
       <div v-if="toastText" class="toast">{{ toastText }}</div>
     </transition>
-
-    <!-- 登录 / 注册弹窗 -->
-    <div v-if="showAuth" class="modal-mask" @click.self="showAuth = false">
-      <div class="modal">
-        <div class="modal-title">账号</div>
-        <div class="modal-sub">登录后标注可同步到云端，换电脑也能用</div>
-        <div class="modal-tabs">
-          <button :class="{ on: authMode === 'login' }" @click="authMode = 'login'">登录</button>
-          <button :class="{ on: authMode === 'register' }" @click="authMode = 'register'">注册</button>
-        </div>
-        <input v-model="authEmail" type="email" class="modal-input" placeholder="邮箱"
-               @keyup.enter="doAuth" />
-        <input v-model="authPassword" type="password" class="modal-input"
-               :placeholder="authMode === 'login' ? '密码' : '密码（至少 6 位）'"
-               @keyup.enter="doAuth" />
-        <button class="btn primary block" :disabled="authBusy" @click="doAuth">
-          {{ authBusy ? '处理中…' : (authMode === 'login' ? '登 录' : '注 册') }}
-        </button>
-        <p class="modal-tip">同一账号在不同电脑登录，即可读取云端标注；谱面图片和音乐文件仍保留在本地。</p>
-      </div>
-    </div>
   </div>
 </template>
 
@@ -1122,7 +1139,6 @@ refreshSavedList();
   padding: 2px 6px;
 }
 .link-btn:hover { color: #e6e8ee; }
-.cloud-off { font-size: 12px; color: #5f6675; white-space: nowrap; }
 
 /* ---------- 工具栏 ---------- */
 .toolbar {
@@ -1162,7 +1178,6 @@ refreshSavedList();
 .btn.primary:hover:not(:disabled) { background: #ffb224; border-color: #ffb224; color: #1a1206; }
 .btn.accent { border-color: #8a5f10; color: #f5b942; }
 .btn.accent:hover:not(:disabled) { border-color: #f59e0b; color: #ffc94d; }
-.btn.ghost { background: transparent; }
 .btn.danger { color: #e5484d; }
 .btn.danger:hover:not(:disabled) { border-color: #e5484d; color: #ff6b70; }
 .btn.block { width: 100%; padding: 9px 0; font-size: 13px; }
@@ -1398,49 +1413,44 @@ refreshSavedList();
   opacity: 0;
 }
 
-/* ---------- 登录 / 注册弹窗 ---------- */
-.modal-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(5, 6, 10, 0.72);
+/* ---------- 登录闸门 ---------- */
+.gate {
+  flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100;
 }
-.modal {
-  width: 340px;
+.gate-card {
+  width: 360px;
+  padding: 36px 32px;
   background: #14171f;
   border: 1px solid #2a3040;
-  border-radius: 14px;
-  padding: 24px;
+  border-radius: 16px;
+  text-align: center;
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
 }
-.modal-title { font-size: 16px; font-weight: 700; }
-.modal-sub { font-size: 12px; color: #6b7280; margin: 4px 0 16px; }
-.modal-tabs {
-  display: flex;
-  gap: 6px;
-  margin-bottom: 16px;
-  background: #0f1218;
-  border-radius: 9px;
-  padding: 4px;
+.gate-icon { font-size: 40px; margin-bottom: 10px; }
+.gate-title { font-size: 18px; font-weight: 700; }
+.gate-sub {
+  font-size: 10px;
+  color: #5f6675;
+  letter-spacing: 3px;
+  margin: 4px 0 24px;
+  text-transform: uppercase;
 }
-.modal-tabs button {
-  flex: 1;
-  padding: 7px 0;
-  border: none;
-  background: transparent;
-  color: #8b92a3;
-  border-radius: 7px;
-  cursor: pointer;
-  font-size: 13px;
+.gate-card .modal-input { text-align: left; margin-bottom: 12px; }
+.gate-checking { color: #8b92a3; font-size: 13px; padding: 24px 0; }
+.gate-error {
+  color: #e5484d;
+  font-size: 12px;
+  margin-bottom: 10px;
+  text-align: left;
 }
-.modal-tabs button.on { background: #262b38; color: #fff; }
+.gate-error-static { color: #e5484d; font-size: 13px; margin: 16px 0 0; }
+.gate-tip { font-size: 11px; color: #5f6675; margin: 14px 0 0; line-height: 1.7; }
 .modal-input {
   width: 100%;
   padding: 9px 12px;
-  margin-bottom: 10px;
   border: 1px solid #2a3040;
   background: #0f1218;
   color: #e6e8ee;
@@ -1449,5 +1459,4 @@ refreshSavedList();
   outline: none;
 }
 .modal-input:focus { border-color: #f59e0b; }
-.modal-tip { font-size: 11px; color: #5f6675; margin: 12px 0 0; line-height: 1.7; }
 </style>
