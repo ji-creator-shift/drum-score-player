@@ -1039,6 +1039,12 @@ if (cloudReady) {
       </div>
 
       <div class="tgroup">
+        <span class="tlabel">存档</span>
+        <input v-model="saveName" class="name-input" type="text"
+               placeholder="存档名（本地/云端共用）" title="本地保存与云端同步共用此名称" />
+      </div>
+
+      <div class="tgroup">
         <span class="tlabel">本地</span>
         <button class="btn" @click="saveAnnotations">保存</button>
         <select v-model="selectedSaved" class="sel">
@@ -1314,6 +1320,17 @@ if (cloudReady) {
   font-size: 12px;
 }
 .num-delay { width: 46px; }
+.name-input {
+  width: 160px;
+  padding: 5px 10px;
+  border: 1px solid #2a3040;
+  background: #1a1e28;
+  color: #e6e8ee;
+  border-radius: 7px;
+  font-size: 12px;
+  outline: none;
+}
+.name-input:focus { border-color: #f59e0b; }
 .check { cursor: pointer; }
 .vol { width: 72px; accent-color: #f59e0b; }
 .music-name {
