@@ -1,11 +1,16 @@
 <script setup>
-import { ref, computed, watch, nextTick, onBeforeUnmount } from 'vue';
-import { renderPdfToImage } from './lib/pdf.js';
+import { ref, computed, watch, nextTick, onBeforeUnmount, toRaw } from 'vue';
 import { resumeAudio, playDrumHit } from './lib/drumSound.js';
-import {
-  cloudReady, currentUser, onAuthChange, signUp, signIn, signOut,
-  cloudList, cloudSave, cloudLoad, cloudDelete,
-} from './lib/cloud.js';
+
+// 云端配置（仅读环境变量判断是否启用；Supabase 客户端按需动态加载，减小首屏包体）
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const cloudReady = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+let cloudApi = null;
+async function ensureCloud() {
+  if (!cloudApi) cloudApi = await import('./lib/cloud.js');
+  return cloudApi;
+}
 
 const DATA_PREFIX = 'drumScore:data:';
 const INDEX_KEY = 'drumScore:index';
@@ -95,11 +100,12 @@ async function doAuth() {
   }
   authBusy.value = true;
   try {
+    const m = await ensureCloud();
     if (authMode.value === 'login') {
-      await signIn(email, pwd);
+      await m.signIn(email, pwd);
       toast('登录成功');
     } else {
-      const r = await signUp(email, pwd);
+      const r = await m.signUp(email, pwd);
       if (r.needsConfirm) {
         toast('注册成功，请到邮箱完成验证后再登录');
         authMode.value = 'login';
@@ -118,7 +124,7 @@ async function doAuth() {
 }
 
 async function doLogout() {
-  await signOut();
+  if (cloudApi) await cloudApi.signOut();
   toast('已退出登录');
 }
 
@@ -132,7 +138,7 @@ watch(user, (u) => {
 async function refreshCloud() {
   if (!user.value) return;
   try {
-    const list = await cloudList();
+    const list = await (await ensureCloud()).cloudList();
     cloudNames.value = list;
     if (!selectedCloud.value && list.length) selectedCloud.value = list[0].id;
   } catch (err) {
@@ -148,7 +154,7 @@ async function cloudSaveNow() {
   }
   const name = (saveName.value || '').trim() || (fileName.value || '未命名');
   try {
-    const id = await cloudSave(name, buildData());
+    const id = await (await ensureCloud()).cloudSave(name, buildData());
     await refreshCloud();
     selectedCloud.value = id;
     toast('已同步到云端：' + name);
@@ -163,7 +169,7 @@ async function cloudLoadNow() {
     return;
   }
   try {
-    const row = await cloudLoad(selectedCloud.value);
+    const row = await (await ensureCloud()).cloudLoad(selectedCloud.value);
     applyData(row.data);
     toast('已读取云端标注：' + row.name);
   } catch (err) {
@@ -177,7 +183,7 @@ async function cloudDeleteNow() {
   const item = cloudNames.value.find((c) => c.id === id);
   if (!confirm('删除云端保存的标注「' + (item ? item.name : '') + '」？')) return;
   try {
-    await cloudDelete(id);
+    await (await ensureCloud()).cloudDelete(id);
     toast('已删除云端标注');
     selectedCloud.value = '';
     refreshCloud();
@@ -312,8 +318,10 @@ async function onFileChange(e) {
   try {
     if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
       const buf = await file.arrayBuffer();
+      // pdf.js 体积大，仅在实际上传 PDF 时才动态加载
+      const { renderPdfToImage } = await import('./lib/pdf.js');
       const res = await renderPdfToImage(buf, 2);
-      imgUrl.value = res.dataUrl;
+      imgUrl.value = res.url;
     } else {
       imgUrl.value = URL.createObjectURL(file);
     }
@@ -478,14 +486,16 @@ function inRepeatRange(m, r) {
   return ge(m) && le(m);
 }
 
+// 撤销：rows/notes 被 Vue 响应式代理包装后 proxy !== 原对象，
+// 栈里存的是原始引用，比较时必须 toRaw 还原，否则过滤永远不命中
 function undoPoint() {
   if (!annotationMode.value) return;
   const last = undoStack.pop();
   if (!last) return;
   if (last.type === 'row') {
-    rows.value = rows.value.filter((r) => r !== last.row);
+    rows.value = rows.value.filter((r) => toRaw(r) !== last.row);
   } else {
-    last.row.notes = last.row.notes.filter((n) => n !== last.note);
+    last.row.notes = last.row.notes.filter((n) => toRaw(n) !== last.note);
   }
 }
 
@@ -807,13 +817,15 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown);
 });
 
-// 云端登录态初始化
+// 云端登录态初始化（后台加载，不阻塞首屏）
 if (cloudReady) {
-  currentUser().then((u) => {
-    user.value = u;
-  });
-  onAuthChange((u) => {
-    user.value = u;
+  ensureCloud().then((m) => {
+    m.currentUser().then((u) => {
+      user.value = u;
+    });
+    m.onAuthChange((u) => {
+      user.value = u;
+    });
   });
 }
 

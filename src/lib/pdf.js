@@ -44,8 +44,10 @@ export async function renderPdfToImage(arrayBuffer, scale = 2) {
     y += c.height;
   }
 
+  // JPEG 编码比 PNG 快数倍、体积小得多（谱面为白底黑字，观感无损）
+  const blob = await new Promise((resolve) => out.toBlob(resolve, 'image/jpeg', 0.92));
   return {
-    dataUrl: out.toDataURL('image/png'),
+    url: URL.createObjectURL(blob),
     width: out.width,
     height: out.height,
   };
