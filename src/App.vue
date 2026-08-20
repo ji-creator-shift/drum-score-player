@@ -81,6 +81,38 @@ const authError = ref('');
 const cloudNames = ref([]); // 云端标注列表 [{id,name,updated_at}]
 const selectedCloud = ref('');
 
+// 邮件邀请 → 首次登录设置密码
+const inviteToken = ref(''); // 有值 = 正在走邀请设置密码流程
+const inviteError = ref('');
+const newPwd = ref('');
+const confirmPwd = ref('');
+const setPwdBusy = ref(false);
+const setPwdError = ref('');
+
+async function doSetPassword() {
+  setPwdError.value = '';
+  if (newPwd.value.length < 6) {
+    setPwdError.value = '密码至少 6 位';
+    return;
+  }
+  if (newPwd.value !== confirmPwd.value) {
+    setPwdError.value = '两次输入的密码不一致';
+    return;
+  }
+  setPwdBusy.value = true;
+  try {
+    await (await ensureCloud()).updatePassword(newPwd.value);
+    inviteToken.value = '';
+    newPwd.value = '';
+    confirmPwd.value = '';
+    toast('密码设置成功，已进入应用');
+  } catch (err) {
+    setPwdError.value = authErrText(err);
+  } finally {
+    setPwdBusy.value = false;
+  }
+}
+
 // 常见 Supabase 错误翻译
 function authErrText(e) {
   const m = String((e && (e.message || e.error_description)) || '未知错误');
@@ -938,6 +970,18 @@ onBeforeUnmount(() => {
 if (cloudReady) {
   ensureCloud()
     .then(async (m) => {
+      // 邮件邀请链接：?token_hash=xxx&type=invite —— 验证后进入设置密码流程
+      const inv = m.parseInviteLink();
+      if (inv) {
+        inviteToken.value = inv.tokenHash;
+        // token 一次性，立即从地址栏清掉，防止刷新重复使用
+        window.history.replaceState({}, '', window.location.pathname);
+        try {
+          await m.verifyInvite(inv.tokenHash);
+        } catch {
+          inviteError.value = '邀请链接无效或已过期';
+        }
+      }
       user.value = await m.currentUser();
       authChecking.value = false;
       m.onAuthChange((u) => {
@@ -962,6 +1006,33 @@ if (cloudReady) {
         <div class="gate-icon">🥁</div>
         <div class="gate-title">鼓谱标注播放器</div>
         <p class="gate-error-static">系统未配置，无法使用，请联系服务商。</p>
+      </div>
+    </div>
+
+    <!-- 邮件邀请：首次登录设置密码 -->
+    <div v-else-if="inviteToken" class="gate">
+      <div class="gate-card">
+        <div class="gate-icon">🥁</div>
+        <div class="gate-title">设置密码</div>
+        <div class="gate-sub">Drum Score Studio</div>
+        <div v-if="authChecking" class="gate-checking">正在验证邀请链接…</div>
+        <template v-else-if="inviteError">
+          <div class="gate-error">{{ inviteError }}</div>
+          <p class="gate-tip">请联系管理员重新发送邀请邮件。</p>
+          <button class="btn block" @click="inviteToken = ''; inviteError = ''">返回登录</button>
+        </template>
+        <template v-else>
+          <p class="gate-desc">账号 <b>{{ user ? user.email : '' }}</b> 首次登录，请设置登录密码</p>
+          <input v-model="newPwd" type="password" class="modal-input" placeholder="新密码（至少 6 位）"
+                 @keyup.enter="doSetPassword" />
+          <input v-model="confirmPwd" type="password" class="modal-input" placeholder="再次输入新密码"
+                 @keyup.enter="doSetPassword" />
+          <div v-if="setPwdError" class="gate-error">{{ setPwdError }}</div>
+          <button class="btn primary block" :disabled="setPwdBusy" @click="doSetPassword">
+            {{ setPwdBusy ? '设置中…' : '确认并进入' }}
+          </button>
+          <p class="gate-tip">设置成功后此密码用于以后登录。</p>
+        </template>
       </div>
     </div>
 
@@ -1570,6 +1641,8 @@ if (cloudReady) {
 }
 .gate-card .modal-input { text-align: left; margin-bottom: 12px; }
 .gate-checking { color: #8b92a3; font-size: 13px; padding: 24px 0; }
+.gate-desc { font-size: 12px; color: #8b92a3; margin: 0 0 16px; line-height: 1.7; }
+.gate-desc b { color: #e6e8ee; word-break: break-all; }
 .gate-error {
   color: #e5484d;
   font-size: 12px;

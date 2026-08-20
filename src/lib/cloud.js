@@ -23,6 +23,32 @@ export async function signIn(email, password) {
   return data.user;
 }
 
+// ---------- 邮件邀请：用户点链接进入应用后自行设置密码 ----------
+// 邀请邮件模板需用 {{ .SiteURL }}?token_hash={{ .TokenHash }}&type=invite 构造链接
+export function parseInviteLink() {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const h = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const tokenHash = q.get('token_hash') || h.get('token_hash');
+    const type = q.get('type') || h.get('type');
+    return tokenHash && type === 'invite' ? { tokenHash } : null;
+  } catch {
+    return null;
+  }
+}
+
+// 用邮件链接中的 token 建立会话（token 一次性，验证后即失效）
+export async function verifyInvite(tokenHash) {
+  const { error } = await sb.auth.verifyOtp({ token_hash: tokenHash, type: 'invite' });
+  if (error) throw error;
+}
+
+// 已登录状态下设置/修改密码
+export async function updatePassword(password) {
+  const { error } = await sb.auth.updateUser({ password });
+  if (error) throw error;
+}
+
 export async function signOut() {
   if (sb) await sb.auth.signOut();
 }
