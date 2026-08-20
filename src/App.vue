@@ -85,7 +85,7 @@ const selectedCloud = ref('');
 function authErrText(e) {
   const m = String((e && (e.message || e.error_description)) || '未知错误');
   if (/invalid login/i.test(m)) return '邮箱或密码错误';
-  if (/row-level security/i.test(m)) return '数据库策略异常：请在 Supabase SQL Editor 重新执行策略 SQL';
+  if (/row-level security/i.test(m)) return '数据库权限异常：' + m; // 附原始错误便于定位
   if (/failed to fetch/i.test(m)) return '网络连接失败，请稍后重试';
   return m;
 }

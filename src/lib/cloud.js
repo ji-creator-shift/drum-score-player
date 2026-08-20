@@ -49,18 +49,19 @@ export async function cloudSave(name, payload) {
   const { data: user } = await sb.auth.getUser();
   if (!user) throw new Error('未登录');
   // 同名覆盖：先查再 upsert（按 user_id + name 唯一）
-  const { data: existing } = await sb
+  const { data: existing, error: selErr } = await sb
     .from('scores')
     .select('id')
     .eq('user_id', user.id)
     .eq('name', name)
     .maybeSingle();
+  if (selErr) throw new Error('查询云端记录失败：' + selErr.message);
   if (existing) {
     const { error } = await sb
       .from('scores')
       .update({ data: payload, updated_at: new Date().toISOString() })
       .eq('id', existing.id);
-    if (error) throw error;
+    if (error) throw new Error('更新云端记录失败：' + error.message);
     return existing.id;
   }
   const { data, error } = await sb
@@ -68,7 +69,7 @@ export async function cloudSave(name, payload) {
     .insert({ user_id: user.id, name, data: payload })
     .select('id')
     .single();
-  if (error) throw error;
+  if (error) throw new Error('新建云端记录失败：' + error.message);
   return data.id;
 }
 
