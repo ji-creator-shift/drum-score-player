@@ -47,6 +47,7 @@ export async function renderPdfToImage(arrayBuffer, scale = 2) {
   // JPEG 编码比 PNG 快数倍、体积小得多（谱面为白底黑字，观感无损）
   const blob = await new Promise((resolve) => out.toBlob(resolve, 'image/jpeg', 0.92));
   return {
+    blob, // 供会话暂存使用（刷新/回收标签页后可恢复）
     url: URL.createObjectURL(blob),
     width: out.width,
     height: out.height,

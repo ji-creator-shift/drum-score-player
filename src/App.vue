@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, watch, nextTick, onBeforeUnmount, toRaw } from 'vue';
 import { resumeAudio, playDrumHit } from './lib/drumSound.js';
+import { saveSession, loadSession, clearSession } from './lib/sessionStore.js';
 
 // 云端配置（仅读环境变量判断是否启用；Supabase 客户端按需动态加载，减小首屏包体）
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || '';
@@ -23,6 +24,7 @@ function localDataKey(name) {
 // 文件 / 画面
 const fileName = ref('');
 const imgUrl = ref('');
+const imgBlob = ref(null); // 谱面原始 Blob（本机暂存，刷新/回收标签页后可恢复）
 const loading = ref(false);
 const surface = ref(null); // 相对定位的图层容器
 const surfaceWrap = ref(null); // 滚动容器
@@ -60,6 +62,7 @@ const importInput = ref(null);
 // 背景音乐 / 延时
 const musicName = ref('');
 const musicUrl = ref('');
+const musicBlob = ref(null); // 音乐原始 Blob（同上）
 const audioEl = ref(null);
 const musicVolume = ref(0.8);   // 音乐音量 0~1
 const musicDelay = ref(2);      // 延时秒数：点击播放后先放音乐，倒计时结束再开始显示标注
@@ -82,6 +85,7 @@ const selectedCloud = ref('');
 function authErrText(e) {
   const m = String((e && (e.message || e.error_description)) || '未知错误');
   if (/invalid login/i.test(m)) return '邮箱或密码错误';
+  if (/row-level security/i.test(m)) return '数据库策略异常：请在 Supabase SQL Editor 重新执行策略 SQL';
   if (/failed to fetch/i.test(m)) return '网络连接失败，请稍后重试';
   return m;
 }
@@ -111,7 +115,11 @@ async function doLogout() {
 }
 
 // 账号切换/退出：清空工作区（谱面、标注、音乐都是本地数据，防止共用电脑时泄露）
+let resetting = false; // 重置期间的赋值不触发暂存回写（避免覆盖待恢复的数据）
+let restoring = false; // 恢复期间的赋值同样不回写
 function resetWorkspace() {
+  resetting = true;
+  nextTick(() => { resetting = false; });
   stop();
   annotationMode.value = false;
   markMode.value = 'rows';
@@ -126,22 +134,120 @@ function resetWorkspace() {
     URL.revokeObjectURL(imgUrl.value);
     imgUrl.value = '';
   }
+  imgBlob.value = null;
   fileName.value = '';
   if (musicUrl.value) {
     URL.revokeObjectURL(musicUrl.value);
     musicUrl.value = '';
     musicName.value = '';
   }
+  musicBlob.value = null;
 }
 
-// 登录态变化 → 清场后重载该账号的本地列表与云端列表
-watch(user, (u) => {
+// ---------- 本机会话暂存（IndexedDB，按账号隔离） ----------
+const sk = (kind, uid) => 'session:' + kind + ':' + uid;
+
+function buildMeta() {
+  return {
+    fileName: fileName.value,
+    saveName: saveName.value,
+    musicName: musicName.value,
+    bpm: bpm.value,
+    soundOn: soundOn.value,
+    musicDelay: musicDelay.value,
+    musicVolume: musicVolume.value,
+    countIn: countIn.value,
+    rowHeightPct: rowHeightPct.value,
+    rows: rows.value,
+    repeatRegions: repeatRegions.value,
+    savedAt: Date.now(),
+  };
+}
+
+// 标注/设置变化 → 防抖保存（小 JSON，开销可忽略）
+let metaTimer = null;
+watch(
+  [rows, repeatRegions, bpm, soundOn, musicDelay, musicVolume, countIn, rowHeightPct, saveName, fileName, musicName],
+  () => {
+    if (resetting || restoring || !user.value) return;
+    clearTimeout(metaTimer);
+    metaTimer = setTimeout(() => {
+      saveSession(sk('meta', user.value.id), buildMeta()).catch(() => {});
+    }, 500);
+  },
+  { deep: true }
+);
+
+// 谱面/音乐 Blob 只在更换时保存（体积大，避免频繁写入）
+watch(imgBlob, (b) => {
+  if (resetting || restoring || !user.value) return;
+  const key = sk('img', user.value.id);
+  if (b) saveSession(key, b).catch(() => {});
+  else clearSession(key).catch(() => {});
+});
+watch(musicBlob, (b) => {
+  if (resetting || restoring || !user.value) return;
+  const key = sk('music', user.value.id);
+  if (b) saveSession(key, b).catch(() => {});
+  else clearSession(key).catch(() => {});
+});
+
+// 登录后恢复上次工作现场（谱面、音乐、标注、全部设置）
+async function restoreSession(uid) {
+  restoring = true;
+  try {
+    const [meta, img, music] = await Promise.all([
+      loadSession(sk('meta', uid)),
+      loadSession(sk('img', uid)),
+      loadSession(sk('music', uid)),
+    ]);
+    if (meta) {
+      if (typeof meta.fileName === 'string') fileName.value = meta.fileName;
+      if (typeof meta.saveName === 'string') saveName.value = meta.saveName;
+      if (typeof meta.musicName === 'string') musicName.value = meta.musicName;
+      if (typeof meta.bpm === 'number') bpm.value = meta.bpm;
+      if (typeof meta.musicDelay === 'number') musicDelay.value = meta.musicDelay;
+      if (typeof meta.musicVolume === 'number') musicVolume.value = meta.musicVolume;
+      if (typeof meta.rowHeightPct === 'number') rowHeightPct.value = meta.rowHeightPct;
+      if (typeof meta.soundOn === 'boolean') soundOn.value = meta.soundOn;
+      if (typeof meta.countIn === 'boolean') countIn.value = meta.countIn;
+      rows.value = normalizeRows(meta.rows);
+      repeatRegions.value = Array.isArray(meta.repeatRegions)
+        ? meta.repeatRegions.filter((r) => r && typeof r.startRow === 'number')
+        : [];
+    }
+    if (img instanceof Blob) {
+      imgBlob.value = img;
+      imgUrl.value = URL.createObjectURL(img);
+    }
+    if (music instanceof Blob) {
+      musicBlob.value = music;
+      musicUrl.value = URL.createObjectURL(music);
+    }
+  } catch {
+    // 恢复失败不影响正常使用
+  } finally {
+    nextTick(() => { restoring = false; });
+  }
+}
+
+// 登录态变化 → 清场后重载该账号的本地列表/云端列表，并恢复工作现场
+watch(user, (u, oldU) => {
+  // 同一账号（token 刷新等）不重复处理，避免误清本机暂存
+  if (u && oldU && u.id === oldU.id) return;
   resetWorkspace();
   cloudNames.value = [];
   selectedCloud.value = '';
+  // 退出/切换账号：清掉上一账号的本机暂存（商用隐私要求）
+  if (oldU) {
+    for (const kind of ['meta', 'img', 'music']) {
+      clearSession(sk(kind, oldU.id)).catch(() => {});
+    }
+  }
   if (u) {
     refreshSavedList();
     refreshCloud();
+    restoreSession(u.id);
   }
 });
 
@@ -321,13 +427,16 @@ async function onFileChange(e) {
   loading.value = true;
   fileName.value = file.name;
   try {
+    if (imgUrl.value) URL.revokeObjectURL(imgUrl.value);
     if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
       const buf = await file.arrayBuffer();
       // pdf.js 体积大，仅在实际上传 PDF 时才动态加载
       const { renderPdfToImage } = await import('./lib/pdf.js');
       const res = await renderPdfToImage(buf, 2);
+      imgBlob.value = res.blob;
       imgUrl.value = res.url;
     } else {
+      imgBlob.value = file;
       imgUrl.value = URL.createObjectURL(file);
     }
     // 新文件默认不加载旧标注
@@ -668,6 +777,7 @@ function onMusicChange(e) {
   if (!file) return;
   stop();
   if (musicUrl.value) URL.revokeObjectURL(musicUrl.value);
+  musicBlob.value = file;
   musicUrl.value = URL.createObjectURL(file);
   musicName.value = file.name;
   e.target.value = '';
@@ -678,6 +788,7 @@ function removeMusic() {
   if (musicUrl.value) URL.revokeObjectURL(musicUrl.value);
   musicUrl.value = '';
   musicName.value = '';
+  musicBlob.value = null;
 }
 
 function clampDelay() {
@@ -830,6 +941,8 @@ if (cloudReady) {
       user.value = await m.currentUser();
       authChecking.value = false;
       m.onAuthChange((u) => {
+        // 同一账号的事件（token 刷新等）不重复处理，避免误清本机暂存
+        if ((u && u.id) === (user.value && user.value.id)) return;
         user.value = u;
       });
     })
