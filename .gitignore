@@ -23,3 +23,8 @@ release
 *.njsproj
 *.sln
 *.sw?
+
+# 环境变量（含云同步密钥，勿提交）
+.env
+.env.*
+!.env.example

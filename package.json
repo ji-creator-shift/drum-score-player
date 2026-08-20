@@ -13,6 +13,7 @@
     "electron:build:mac": "vite build && electron-builder --mac"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.112.3",
     "pdfjs-dist": "^4.8.0",
     "vue": "^3.5.40"
   },
@@ -23,7 +24,9 @@
     "vite": "^8.2.0"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["electron"]
+    "onlyBuiltDependencies": [
+      "electron"
+    ]
   },
   "build": {
     "appId": "com.drumscore.player",
@@ -40,7 +43,13 @@
     },
     "mac": {
       "target": [
-        { "target": "zip", "arch": ["x64", "arm64"] }
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
       ]
     },
     "nsis": {
