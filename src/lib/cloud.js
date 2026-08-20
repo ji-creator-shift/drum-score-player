@@ -46,13 +46,11 @@ export async function cloudList() {
 }
 
 export async function cloudSave(name, payload) {
-  const { data: user } = await sb.auth.getUser();
-  if (!user) throw new Error('未登录');
-  // 同名覆盖：先查再 upsert（按 user_id + name 唯一）
+  // RLS 已按登录身份隔离数据；user_id 由数据库默认值 auth.uid() 自动填充。
+  // 客户端不传用户 id，规避会话信息不完整时出现 uuid 参数无效的问题。
   const { data: existing, error: selErr } = await sb
     .from('scores')
     .select('id')
-    .eq('user_id', user.id)
     .eq('name', name)
     .maybeSingle();
   if (selErr) throw new Error('查询云端记录失败：' + selErr.message);
@@ -66,7 +64,7 @@ export async function cloudSave(name, payload) {
   }
   const { data, error } = await sb
     .from('scores')
-    .insert({ user_id: user.id, name, data: payload })
+    .insert({ name, data: payload })
     .select('id')
     .single();
   if (error) throw new Error('新建云端记录失败：' + error.message);
