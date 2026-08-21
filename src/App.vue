@@ -89,6 +89,16 @@ const confirmPwd = ref('');
 const setPwdBusy = ref(false);
 const setPwdError = ref('');
 
+// 自动标注（方案A：图像分析预标注）
+const detecting = ref(false);
+
+// 账号有效期（profiles.expires_at，null = 永久）
+const expiryDays = ref(null);
+
+// 数据飞轮（方案B）：用户同意后，云同步时附带上传谱面图片用于训练自动识别
+const contributeData = ref(localStorage.getItem('drumScore:contribute') === '1');
+watch(contributeData, (v) => localStorage.setItem('drumScore:contribute', v ? '1' : '0'));
+
 async function doSetPassword() {
   setPwdError.value = '';
   if (newPwd.value.length < 6) {
@@ -270,6 +280,7 @@ watch(user, (u, oldU) => {
   resetWorkspace();
   cloudNames.value = [];
   selectedCloud.value = '';
+  expiryDays.value = null;
   // 退出/切换账号：清掉上一账号的本机暂存（商用隐私要求）
   if (oldU) {
     for (const kind of ['meta', 'img', 'music']) {
@@ -277,11 +288,34 @@ watch(user, (u, oldU) => {
     }
   }
   if (u) {
+    checkExpiry(u);
     refreshSavedList();
     refreshCloud();
     restoreSession(u.id);
   }
 });
+
+// 账号有效期：登录后检查，过期自动登出（商用授权控制）
+async function checkExpiry(u) {
+  const m = await ensureCloud();
+  let exp = null;
+  try {
+    exp = await m.getAccountExpiry();
+  } catch {
+    return; // 查询失败不阻断登录（profiles 表未建等）
+  }
+  if (!exp) return;
+  const end = new Date(exp).getTime();
+  if (isNaN(end)) return;
+  if (end <= Date.now()) {
+    if (user.value && user.value.id === u.id) {
+      await m.signOut();
+      toast('账号已过期，请联系管理员续期');
+    }
+    return;
+  }
+  expiryDays.value = Math.ceil((end - Date.now()) / 86400000);
+}
 
 async function refreshCloud() {
   if (!user.value) return;
@@ -298,6 +332,12 @@ async function cloudSaveNow() {
   const name = (saveName.value || '').trim() || (fileName.value || '未命名');
   try {
     const id = await (await ensureCloud()).cloudSave(name, buildData());
+    // 数据飞轮：用户已同意时附带上传谱面图片（匿名，用于改进自动识别；失败不影响同步）
+    if (contributeData.value && imgBlob.value && user.value) {
+      try {
+        await (await ensureCloud()).uploadTrainingImage(user.value.id, id, imgBlob.value);
+      } catch { /* 静默：训练图上传失败不影响标注同步 */ }
+    }
     await refreshCloud();
     selectedCloud.value = id;
     toast('已同步到云端：' + name);
@@ -502,6 +542,34 @@ function toggleAnnotation() {
   }
 }
 
+// ---------- 自动标注（方案A：图像分析生成预标注，标注模式下可继续微调） ----------
+async function autoAnnotate() {
+  if (!imgUrl.value || !imgBlob.value) {
+    toast('请先上传鼓谱文件');
+    return;
+  }
+  if (rows.value.length && !confirm('自动标注会覆盖现有 ' + totalNotes.value + ' 个音标，继续吗？')) return;
+  detecting.value = true;
+  try {
+    // 识别模块体积较大，仅在实际使用时动态加载
+    const { detectScore } = await import('./lib/autoDetect.js');
+    const result = await detectScore(imgBlob.value);
+    stop();
+    rows.value = result;
+    undoStack = [];
+    repeatRegions.value = [];
+    repeatSel.value = null;
+    annotationMode.value = true;
+    markMode.value = 'notes';
+    const count = result.reduce((s, r) => s + r.notes.length, 0);
+    toast('自动识别：' + result.length + ' 行 ' + count + ' 个音标，请检查微调');
+  } catch (err) {
+    toast('自动标注：' + (err.message || '识别失败，请改用手动标注'));
+  } finally {
+    detecting.value = false;
+  }
+}
+
 function setMarkMode(m) {
   if (m === 'notes' && !rows.value.length) {
     toast('请先标注行光带');
@@ -520,6 +588,18 @@ function onSurfaceMove(e) {
   if (!el) return;
   const r = el.getBoundingClientRect();
   hoverY.value = (e.clientY - r.top) / r.height;
+}
+
+// 触摸设备：标行模式下手指滑动显示预览光带，方便定位后点按固定
+function onTouchMove(e) {
+  if (!annotationMode.value || markMode.value !== 'rows') return;
+  const el = surface.value;
+  if (!el) return;
+  const t = e.touches[0];
+  if (!t) return;
+  e.preventDefault(); // 正在定位行光带时阻止页面滚动
+  const r = el.getBoundingClientRect();
+  hoverY.value = (t.clientY - r.top) / r.height;
 }
 
 function onSurfaceLeave() {
@@ -1080,6 +1160,8 @@ if (cloudReady) {
       <div class="user-chip">
         <span class="avatar">{{ (user.email || 'U').slice(0, 1).toUpperCase() }}</span>
         <span class="user-email">{{ user.email }}</span>
+        <span v-if="expiryDays !== null" class="expiry" :class="{ soon: expiryDays <= 7 }"
+              :title="'账号有效期剩余 ' + expiryDays + ' 天'">{{ expiryDays }}天后到期</span>
         <button class="link-btn" @click="doLogout">退出</button>
       </div>
     </header>
@@ -1090,6 +1172,10 @@ if (cloudReady) {
         <span class="tlabel">标注</span>
         <button class="btn" :class="{ active: annotationMode }" @click="toggleAnnotation">
           {{ annotationMode ? '退出标注' : '手动标注' }}
+        </button>
+        <button class="btn" :disabled="detecting || !imgUrl" @click="autoAnnotate"
+                :title="'自动识别谱行与音符头，生成预标注后可手动微调'">
+          {{ detecting ? '识别中…' : '自动标注' }}
         </button>
         <template v-if="annotationMode">
           <button class="btn" :class="{ active: markMode === 'rows' }" @click="setMarkMode('rows')">行</button>
@@ -1136,6 +1222,9 @@ if (cloudReady) {
         </select>
         <button class="btn" @click="cloudLoadNow">读取</button>
         <button class="btn danger" @click="cloudDeleteNow">删除</button>
+        <label class="field check" title="同意后，同步时将匿名上传当前谱面图片，用于改进自动识别功能（不上传音乐，不含个人信息）">
+          <input type="checkbox" v-model="contributeData" /> 贡献数据
+        </label>
       </div>
 
       <div class="tgroup">
@@ -1199,7 +1288,7 @@ if (cloudReady) {
     <div class="surface-wrap" ref="surfaceWrap">
       <div v-if="loading" class="loading">正在加载文件…</div>
       <div v-if="imgUrl" class="surface" ref="surface" @click="onSurfaceClick"
-           @mousemove="onSurfaceMove" @mouseleave="onSurfaceLeave"
+           @mousemove="onSurfaceMove" @mouseleave="onSurfaceLeave" @touchmove="onTouchMove"
            :class="{ crosshair: annotationMode && !isPlaying }">
         <img :src="imgUrl" class="score-img" alt="鼓谱" />
 
@@ -1227,7 +1316,7 @@ if (cloudReady) {
       <div v-else-if="!loading" class="empty">
         <div class="empty-icon">🥁</div>
         <p>请点击上方「上传鼓谱」按钮，选择图片或 PDF 文件。</p>
-        <p class="hint">上传后点「手动标注」：先点击固定行光带（行高可调），再切「序号」在行内点击编号；需要反复练习的片段可用「重复」点击起止序号，播放时自动多走几遍。标注可保存到本地或云端。</p>
+        <p class="hint">上传后可点「自动标注」一键识别谱行与音符，再手动微调；也可点「手动标注」：先点击固定行光带（行高可调），再切「序号」在行内点击编号；需要反复练习的片段可用「重复」点击起止序号，播放时自动多走几遍。标注可保存到本地或云端。</p>
       </div>
 
       <!-- 延时倒计时遮罩 -->
@@ -1319,6 +1408,18 @@ if (cloudReady) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.expiry {
+  font-size: 11px;
+  color: #8b92a3;
+  background: #232836;
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+.expiry.soon {
+  color: #ffb224;
+  background: rgba(245, 158, 11, 0.12);
 }
 .link-btn {
   background: none;
@@ -1662,4 +1763,51 @@ if (cloudReady) {
   outline: none;
 }
 .modal-input:focus { border-color: #f59e0b; }
+
+/* ---------- 手机 / 平板适配 ---------- */
+@media (max-width: 768px) {
+  /* 顶栏：隐藏次要文字，保留核心操作 */
+  .topbar { height: 48px; padding: 0 10px; gap: 8px; }
+  .brand-text, .filename { display: none; }
+  .user-email { display: none; }
+  .expiry { font-size: 10px; padding: 1px 6px; }
+  .file-btn { padding: 8px 12px; font-size: 12px; }
+
+  /* 工具栏：纵向分组排列，触控目标加大 */
+  .toolbar { flex-direction: column; align-items: stretch; gap: 8px; padding: 8px 10px; }
+  .tgroup { flex-wrap: wrap; row-gap: 8px; }
+  .tlabel { align-self: center; }
+  .btn { padding: 8px 14px; font-size: 13px; min-height: 36px; }
+  .num { width: 60px; min-height: 36px; box-sizing: border-box; }
+  .name-input { flex: 1; min-width: 0; }
+  .sel { max-width: 42vw; min-height: 36px; box-sizing: border-box; }
+  .vol { width: 88px; }
+
+  /* 状态栏与谱面区域更紧凑 */
+  .status { font-size: 11px; padding: 6px 10px; line-height: 1.6; }
+  .surface-wrap { padding: 10px; }
+
+  /* 标注元素：序号点稍小、触控仍易点 */
+  .marker { width: 22px; height: 22px; margin: -11px 0 0 -11px; }
+  .marker.pickable { box-shadow: 0 0 0 6px rgba(59, 130, 246, 0); }
+  .row-band { border-top-width: 2px; border-bottom-width: 2px; }
+  .band-label { font-size: 12px; padding: 3px 8px; }
+
+  /* 倒计时字号缩小 */
+  .countdown { font-size: 72px; }
+
+  /* 登录卡片占满宽度 */
+  .gate { padding: 16px; }
+  .gate-card { width: 100%; max-width: 360px; padding: 28px 22px; }
+
+  /* 轻提示在手机上贴底居中 */
+  .toast { bottom: 16px; max-width: 88vw; white-space: normal; text-align: center; }
+}
+
+/* 触摸设备：取消悬停态闪烁，光标不再显示十字 */
+@media (hover: none) {
+  .surface.crosshair { cursor: default; }
+  .btn:hover:not(:disabled) { border-color: #2a3040; color: #c7ccd8; }
+  .btn.primary:hover:not(:disabled) { background: #f59e0b; border-color: #f59e0b; color: #1a1206; }
+}
 </style>

@@ -107,3 +107,26 @@ export async function cloudDelete(id) {
   const { error } = await sb.from('scores').delete().eq('id', id);
   if (error) throw error;
 }
+
+// ---------- 账号有效期（profiles 表，管理员在后台维护 expires_at） ----------
+// 返回 ISO 时间字符串；null 表示永久（表未建 / 无记录 / 字段为空均按永久处理）
+export async function getAccountExpiry() {
+  const { data, error } = await sb.from('profiles').select('expires_at').maybeSingle();
+  if (error) return null; // 表不存在等情况不阻断登录
+  if (!data || !data.expires_at) return null;
+  return data.expires_at;
+}
+
+// ---------- 训练数据飞轮（用户同意后，同步时匿名上传谱面图片） ----------
+// 存放于私有桶 training/{user_id}/{score_id}，同名覆盖；仅管理员可用 service key 提取训练
+export async function uploadTrainingImage(userId, scoreId, blob) {
+  const ext = blob && blob.type && blob.type.includes('png') ? 'png' : 'jpg';
+  const path = userId + '/' + scoreId + '.' + ext;
+  const { error } = await sb.storage
+    .from('training')
+    .upload(path, blob, {
+      contentType: blob && blob.type ? blob.type : 'image/jpeg',
+      upsert: true, // 同一存档重复同步时覆盖旧图
+    });
+  if (error) throw new Error(error.message);
+}
